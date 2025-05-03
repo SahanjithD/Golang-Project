@@ -1,11 +1,8 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"flag"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -19,111 +16,74 @@ import (
 	"mini_etcd/internal/raft"
 )
 
-// validatePeers checks the format and validity of peer configuration
-func validatePeers(peersStr string) (map[string]string, error) {
+// Config holds the server configuration
+type Config struct {
+	NodeID   string
+	Address  string
+	PeersStr string
+}
+
+// parsePeers converts the peers string into a map of peer IDs to addresses
+func parsePeers(peersStr string) map[string]string {
 	peers := map[string]string{}
 	if peersStr == "" {
-		return peers, nil
+		return peers
 	}
 
 	for _, p := range strings.Split(peersStr, ",") {
 		parts := strings.Split(p, "=")
-		if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-			return nil, fmt.Errorf("invalid peer format: %s", p)
+		if len(parts) == 2 && parts[0] != "" && parts[1] != "" {
+			peers[parts[0]] = parts[1]
 		}
-		peers[parts[0]] = parts[1]
 	}
-	return peers, nil
+	return peers
 }
 
-// ensureTempDir creates the .temp directory if it doesn't exist
-func ensureTempDir() error {
-	return os.MkdirAll(".temp", 0755)
+// setupDatabase initializes the BoltDB database
+func setupDatabase(nodeID string) (*bolt.DB, error) {
+	// Ensure .temp directory exists
+	if err := os.MkdirAll(".temp", 0755); err != nil {
+		return nil, err
+	}
+
+	dbPath := filepath.Join(".temp", "raft_"+nodeID+".bolt")
+	return bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 1 * time.Second})
 }
 
-func main() {
-	// Graceful shutdown setup
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	id := flag.String("id", "node1", "Node ID")
-	addr := flag.String("addr", ":9001", "Listen address")
-	peersStr := flag.String("peers", "", "Comma list id=addr")
-	flag.Parse()
-
-	// Validate and parse peers
-	peers, err := validatePeers(*peersStr)
-	if err != nil {
-		log.Fatalf("[ERROR] Invalid peer configuration: %v", err)
-	}
-
-	// Ensure temp directory exists
-	if err := ensureTempDir(); err != nil {
-		log.Fatalf("[ERROR] Failed to create temp directory: %v", err)
-	}
-
-	// ---------- raft + kv ----------
-	dbPath := filepath.Join(".temp", "raft_"+*id+".bolt")
-	db, err := bolt.Open(dbPath, 0600, &bolt.Options{Timeout: 1 * time.Second})
-	if err != nil {
-		log.Fatalf("[ERROR] Failed to open database: %s: %v", *id, err)
-	}
-	defer func() {
-		if err := db.Close(); err != nil {
-			log.Printf("[WARN] Error closing database: %v", err)
-		}
-	}()
+// setupRaftNode initializes the Raft node and key-value store
+func setupRaftNode(config Config, db *bolt.DB) (*kv.Store, *raft.Node, chan raft.ApplyMsg) {
 	store := kv.New(db, 20)
 	applyCh := make(chan raft.ApplyMsg, 64)
-	node := raft.NewNode(*id, peers, applyCh, db)
+	peers := parsePeers(config.PeersStr)
+	node := raft.NewNode(config.NodeID, peers, applyCh, db)
 
-	go func() { // apply committed commands
+	// Background goroutine to apply committed commands
+	go func() {
 		for msg := range applyCh {
 			if msg.CommandValid {
 				store.Apply(msg.Command)
 			}
 		}
 	}()
-	node.Start() // ticker only
 
-	// ---------- http mux (single listener) ----------
+	node.Start() // Start ticker
+	return store, node, applyCh
+}
+
+// setupHTTPHandlers configures the HTTP routes for key-value operations
+func setupHTTPHandlers(store *kv.Store, node *raft.Node) *http.ServeMux {
 	mux := http.NewServeMux()
 
-	// Raft RPCs under /raft/*
+	// Raft RPCs
 	mux.Handle("/raft/", http.StripPrefix("/raft", node.Trans()))
 
-	// Middleware for logging and error handling
-	logMiddleware := func(next http.HandlerFunc) http.HandlerFunc {
-		return func(w http.ResponseWriter, r *http.Request) {
-			log.Printf("[REQUEST] %s %s", r.Method, r.URL.Path)
-			next.ServeHTTP(w, r)
-		}
-	}
-
 	// PUT handler
-	mux.HandleFunc("/put", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		// Validate request method
-		if r.Method != http.MethodPost {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Decode and validate request body
+	mux.HandleFunc("/put", func(w http.ResponseWriter, r *http.Request) {
 		var body struct{ Key, Value string }
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
-
-		// Input validation
-		if body.Key == "" {
-			http.Error(w, "Key cannot be empty", http.StatusBadRequest)
-			return
-		}
-
-		// Propose command with timeout
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
 
 		idx, ok := node.Propose(kv.SetCmd{Key: body.Key, Value: body.Value})
 		if !ok {
@@ -131,75 +91,40 @@ func main() {
 			return
 		}
 
-		// Wait for commit with timeout
-		for {
-			select {
-			case <-ctx.Done():
-				http.Error(w, "Commit timeout", http.StatusRequestTimeout)
+		// Wait for commit with a timeout
+		for i := 0; i < 100; i++ { // 1 second timeout
+			if node.LastApplied() >= idx {
+				w.WriteHeader(http.StatusNoContent)
 				return
-			default:
-				if node.LastApplied() >= idx {
-					w.WriteHeader(http.StatusNoContent)
-					return
-				}
-				time.Sleep(10 * time.Millisecond)
 			}
+			time.Sleep(10 * time.Millisecond)
 		}
-	}))
+
+		http.Error(w, "Commit timeout", http.StatusRequestTimeout)
+	})
 
 	// GET handler
-	mux.HandleFunc("/get", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		// Validate request method
-		if r.Method != http.MethodGet {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Decode and validate request body
+	mux.HandleFunc("/get", func(w http.ResponseWriter, r *http.Request) {
 		var body struct{ Key string }
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
 
-		// Input validation
-		if body.Key == "" {
-			http.Error(w, "Key cannot be empty", http.StatusBadRequest)
-			return
-		}
-
-		// Retrieve value
 		v := store.Get(body.Key)
 		if err := json.NewEncoder(w).Encode(struct{ Value string }{Value: v}); err != nil {
-			log.Printf("[ERROR] Failed to encode response: %v", err)
+			log.Printf("Error encoding response: %v", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 		}
-	}))
+	})
 
 	// DEL handler
-	mux.HandleFunc("/del", logMiddleware(func(w http.ResponseWriter, r *http.Request) {
-		// Validate request method
-		if r.Method != http.MethodDelete {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		// Decode and validate request body
+	mux.HandleFunc("/del", func(w http.ResponseWriter, r *http.Request) {
 		var body struct{ Key string }
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
-
-		// Input validation
-		if body.Key == "" {
-			http.Error(w, "Key cannot be empty", http.StatusBadRequest)
-			return
-		}
-
-		// Propose delete command with timeout
-		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-		defer cancel()
 
 		idx, ok := node.Propose(kv.DelCmd{Key: body.Key})
 		if !ok {
@@ -207,39 +132,45 @@ func main() {
 			return
 		}
 
-		// Wait for commit with timeout
-		for {
-			select {
-			case <-ctx.Done():
-				http.Error(w, "Commit timeout", http.StatusRequestTimeout)
+		// Wait for commit with a timeout
+		for i := 0; i < 100; i++ { // 1 second timeout
+			if node.LastApplied() >= idx {
+				w.WriteHeader(http.StatusNoContent)
 				return
-			default:
-				if node.LastApplied() >= idx {
-					w.WriteHeader(http.StatusNoContent)
-					return
-				}
-				time.Sleep(10 * time.Millisecond)
 			}
+			time.Sleep(10 * time.Millisecond)
 		}
-	}))
 
-	// Graceful shutdown setup
-	server := &http.Server{
-		Addr:    *addr,
-		Handler: mux,
+		http.Error(w, "Commit timeout", http.StatusRequestTimeout)
+	})
+
+	return mux
+}
+
+func main() {
+	// Parse command-line flags
+	config := Config{
+		NodeID:   *flag.String("id", "node1", "Node ID"),
+		Address:  *flag.String("addr", ":9001", "Listen address"),
+		PeersStr: *flag.String("peers", "", "Comma list id=addr"),
 	}
+	flag.Parse()
 
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := server.Shutdown(shutdownCtx); err != nil {
-			log.Printf("[ERROR] Server shutdown: %v", err)
-		}
-	}()
-
-	log.Printf("[INFO] %s listening on %s", *id, *addr)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("[ERROR] Server failed: %v", err)
+	// Setup database
+	db, err := setupDatabase(config.NodeID)
+	if err != nil {
+		log.Fatalf("Database setup failed: %v", err)
 	}
+	defer db.Close()
+
+	// Setup Raft node and key-value store
+	store, node, applyCh := setupRaftNode(config, db)
+	defer close(applyCh)
+
+	// Setup HTTP handlers
+	mux := setupHTTPHandlers(store, node)
+
+	// Start server
+	log.Printf("[INFO] %s listening on %s", config.NodeID, config.Address)
+	log.Fatal(http.ListenAndServe(config.Address, mux))
 }
